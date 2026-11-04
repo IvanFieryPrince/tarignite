@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Tarignite: one-click installer for prebuilt apps shipped as tar archives.
+# https://github.com/IvanFieryPrince/tarignite
+# Extracts the archive to ~/.local/opt/<name>, finds the main program,
+# and adds a launcher to the application menu. No sudo needed.
+#
+# Usage:
+#   tarignite <archive>          install an app
+#   tarignite --remove <name>    remove an app installed by this tool
+set -u
+
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+OPT_DIR="$HOME/.local/opt"
+
+notify() { # $1 = info|error, $2 = text
+  if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    zenity "--$1" --no-markup --title="Install this app" --text="$2" 2>/dev/null
+  else
+    echo "$1: $2" >&2
+  fi
+}
+die() { notify error "$1"; exit 1; }
+
+# ---------- remove mode ----------
+if [ "${1:-}" = "--remove" ]; then
+  [ -n "${2:-}" ] || die "Usage: tarignite --remove <app name>"
+  found=0
+  for d in "$APPS_DIR"/*.desktop; do
+    [ -f "$d" ] || continue
+    grep -qE '^X-Installed-By=(tarignite|install-targz)' "$d" || continue
+    n=$(grep -m1 '^Name=' "$d" | cut -d= -f2-)
+    if [ "${n,,}" = "${2,,}" ]; then
+      dir=$(grep -m1 '^X-Install-Dir=' "$d" | cut -d= -f2-)
+      case "$dir" in "$OPT_DIR"/?*) rm -rf -- "$dir" ;; esac
+      rm -f -- "$d"
+      found=1
+      echo "Removed $n"
+    fi
+  done
+  [ "$found" = 1 ] || die "No app named '$2' was installed by tarignite."
+  exit 0
+fi
+
+# ---------- checks ----------
+FILE="${1:-}"
+[ -n "$FILE" ] && [ -f "$FILE" ] || die "No archive given."
+case "${FILE,,}" in
+  *.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz2) ;;
+  *) die "Not a supported archive (.tar.gz, .tgz, .tar.xz, .tar.bz2): $(basename "$FILE")" ;;
+esac
+command -v file >/dev/null 2>&1 || die "The 'file' command is missing. Run: sudo apt install file"
+
+# ---------- names ----------
+BASE=$(basename "$FILE")
+NAME=$(printf '%s' "$BASE" | sed -E 's/\.(tar\.(gz|xz|bz2)|tgz|txz|tbz2)$//I')
+# Friendly name: drop platform and version parts (Filee-2.3.0-linux-x64 -> Filee)
+SHORT=$(printf '%s' "$NAME" | sed -E 's/[-_.](linux|x86|x64|amd64|x86_64|64bit|64)([-_.].*)?$//I; s/[-_.]v?[0-9].*$//')
+[ -n "$SHORT" ] || SHORT="$NAME"
+DEST="$OPT_DIR/$NAME"
+
+# ---------- extract ----------
+mkdir -p "$OPT_DIR" || die "Cannot create $OPT_DIR"
+TMP=$(mktemp -d "$OPT_DIR/.extract.XXXXXX") || die "Cannot create a temporary folder in $OPT_DIR"
+trap 'rm -rf "$TMP"' EXIT
+
+tar -xf "$FILE" -C "$TMP" 2>/dev/null || die "Could not extract $BASE. The file may be damaged."
+
+# If the archive has one top-level folder, use its contents directly
+if [ "$(find "$TMP" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -d "$(find "$TMP" -mindepth 1 -maxdepth 1)" ]; then
+  SRC=$(find "$TMP" -mindepth 1 -maxdepth 1)
+else
+  SRC="$TMP"
+fi
+rm -rf -- "$DEST"
+mv -- "$SRC" "$DEST" || die "Could not move files to $DEST"
+
+# ---------- find the main program ----------
+# Real programs only: executable ELF binaries without a file extension,
+# skipping helpers such as sandbox, crashpad, updaters and uninstallers.
+mapfile -t ELFS < <(
+  find "$DEST" -maxdepth 3 -type f -executable ! -name '*.*' \
+    ! -iname '*sandbox*' ! -iname '*crashpad*' ! -iname '*uninstall*' \
+    ! -iname '*update*' ! -iname '*helper*' -print0 |
+  while IFS= read -r -d '' f; do
+    file -b -- "$f" | grep -q '^ELF' && printf '%s\n' "$f"
+  done | awk '{ n = gsub("/", "/"); print n "\t" $0 }' | sort -n | cut -f2-
+)
+
+norm() { printf '%s' "$1" | tr -d ' _-' | tr '[:upper:]' '[:lower:]'; }
+depth() { printf '%s' "$1" | tr -cd '/' | wc -c; }
+
+EXE=""
+WANT=$(norm "$SHORT")
+
+# 1) a program named like the app (shallowest first)
+for f in "${ELFS[@]}"; do
+  if [ "$(norm "$(basename "$f")")" = "$WANT" ]; then EXE="$f"; break; fi
+done
+
+# 2) the only program at the shallowest level
+if [ -z "$EXE" ] && [ "${#ELFS[@]}" -ge 1 ]; then
+  top=$(depth "${ELFS[0]}")
+  mapfile -t TOP < <(for f in "${ELFS[@]}"; do [ "$(depth "$f")" -eq "$top" ] && printf '%s\n' "$f"; done)
+  [ "${#TOP[@]}" -eq 1 ] && EXE="${TOP[0]}"
+fi
+
+# 3) no binaries at all: look for a start script
+if [ -z "$EXE" ] && [ "${#ELFS[@]}" -eq 0 ]; then
+  EXE=$(find "$DEST" -maxdepth 2 -type f -executable \
+        \( -iname 'start*.sh' -o -iname 'run*.sh' -o -iname 'launch*.sh' -o -iname "${SHORT}.sh" \) | head -n1)
+  if [ -z "$EXE" ]; then
+    mapfile -t SH < <(find "$DEST" -maxdepth 2 -type f -executable -name '*.sh' \
+                      ! -iname '*install*' ! -iname '*uninstall*')
+    [ "${#SH[@]}" -eq 1 ] && EXE="${SH[0]}"
+  fi
+fi
+
+# 4) still unsure: ask, showing only real programs
+if [ -z "$EXE" ] && [ "${#ELFS[@]}" -gt 1 ]; then
+  rel=()
+  for f in "${ELFS[@]}"; do rel+=("${f#"$DEST"/}"); done
+  CHOICE=$(zenity --list --title="Which one starts the app?" \
+           --text="Could not tell automatically. Pick the main program (usually named like the app)." \
+           --column="Program" "${rel[@]}" --width=600 --height=400) || { rm -rf -- "$DEST"; exit 0; }
+  EXE="$DEST/$CHOICE"
+fi
+
+if [ -z "$EXE" ] || [ ! -f "$EXE" ]; then
+  die "No runnable program found in $BASE. It may be source code that needs compiling. Files were extracted to: $DEST"
+fi
+
+# ---------- icon ----------
+find_icon() {
+  local f b
+  while IFS= read -r f; do
+    b=$(basename "$f" | tr '[:upper:]' '[:lower:]')
+    case "$b" in *"$1"*) printf '%s\n' "$f"; return 0 ;; esac
+  done < <(find "$DEST" -maxdepth 4 -type f \( -iname '*.png' -o -iname '*.svg' -o -iname '*.xpm' \))
+  return 1
+}
+ICON=$(find_icon "$(printf '%s' "$SHORT" | tr '[:upper:]' '[:lower:]')") || ICON=""
+[ -n "$ICON" ] || ICON=$(find_icon "icon") || ICON=""
+[ -n "$ICON" ] || ICON=$(find "$DEST" -maxdepth 4 -type f \( -iname '*.png' -o -iname '*.svg' \) | head -n1)
+[ -n "$ICON" ] || ICON="application-x-executable"
+
+# ---------- menu launcher ----------
+mkdir -p "$APPS_DIR"
+DESKTOP="$APPS_DIR/$NAME.desktop"
+EXE_ESC=${EXE//%/%%}
+cat > "$DESKTOP" <<DESK
+[Desktop Entry]
+Type=Application
+Name=$SHORT
+Comment=Installed with tarignite
+Exec="$EXE_ESC"
+Path=$(dirname "$EXE")
+Icon=$ICON
+Terminal=false
+StartupNotify=true
+Categories=Utility;
+X-Installed-By=tarignite
+X-Install-Dir=$DEST
+DESK
+chmod +x "$DESKTOP"
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" 2>/dev/null
+
+notify info "$SHORT is installed. Find it in your Menu."
